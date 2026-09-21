@@ -54,6 +54,7 @@ function base32Decode(input) {
   }
 
   const bytes = [];
+
   for (let i = 0; i + 8 <= bits.length; i += 8) {
     bytes.push(parseInt(bits.slice(i, i + 8), 2));
   }
@@ -215,6 +216,7 @@ function getIndiaToday() {
   }).formatToParts(new Date());
 
   const map = {};
+
   for (const part of parts) {
     map[part.type] = part.value;
   }
@@ -257,8 +259,7 @@ function resolveDateRange(url) {
     };
   }
 
-  const date = url.searchParams.get('date');
-  return getIndiaDateRange(date);
+  return getIndiaDateRange(url.searchParams.get('date'));
 }
 
 async function authenticatedFetch(url, options = {}) {
@@ -278,10 +279,6 @@ async function authenticatedFetch(url, options = {}) {
   let response = await execute(false);
 
   if (response.status === 401 || response.status === 403) {
-    console.log(
-      `[auth] upstream returned ${response.status}, refreshing token`
-    );
-
     clearToken();
     response = await execute(true);
   }
@@ -293,6 +290,7 @@ async function parseUpstreamResponse(response, name) {
   const text = await response.text();
 
   let data;
+
   try {
     data = JSON.parse(text);
   } catch {
@@ -311,44 +309,111 @@ async function parseUpstreamResponse(response, name) {
   return data;
 }
 
+// =====================================================
+// 自動抓取所有分頁
+// API 目前資料陣列位置：response.data.data
+// =====================================================
+async function fetchAllPages({
+  pathname,
+  range,
+  extraParams = {},
+  name,
+}) {
+  const PAGE_SIZE = 100;
+  const MAX_PAGES = 100;
+
+  let page = 1;
+  let allRows = [];
+  let firstResponse = null;
+
+  while (page <= MAX_PAGES) {
+    const url = new URL(`${API_BASE}${pathname}`);
+
+    url.searchParams.set('sorts[id]', 'desc');
+    url.searchParams.set(
+      'start_time',
+      String(range.start_time)
+    );
+    url.searchParams.set(
+      'end_time',
+      String(range.end_time)
+    );
+
+    for (const [key, value] of Object.entries(extraParams)) {
+      url.searchParams.set(key, String(value));
+    }
+
+    url.searchParams.set('current_page', String(page));
+    url.searchParams.set('page_size', String(PAGE_SIZE));
+
+    const response = await authenticatedFetch(url);
+    const json = await parseUpstreamResponse(
+      response,
+      `${name} page ${page}`
+    );
+
+    if (!firstResponse) {
+      firstResponse = json;
+    }
+
+    const rows = Array.isArray(json?.data?.data)
+      ? json.data.data
+      : [];
+
+    allRows.push(...rows);
+
+    console.log(
+      `[${name}] page=${page}, rows=${rows.length}, total=${allRows.length}`
+    );
+
+    if (rows.length < PAGE_SIZE) {
+      break;
+    }
+
+    page += 1;
+  }
+
+  if (!firstResponse) {
+    firstResponse = {
+      data: {
+        data: [],
+      },
+    };
+  }
+
+  if (!firstResponse.data) {
+    firstResponse.data = {};
+  }
+
+  firstResponse.data.data = allRows;
+
+  // 額外提供實際抓到的筆數，方便 n8n 檢查
+  firstResponse.data.fetched_count = allRows.length;
+
+  return firstResponse;
+}
+
 async function getPromotionChannel(range) {
-  const url = new URL(
-    `${API_BASE}/api/ad/report/promotionchannelstat`
-  );
-
-  url.searchParams.set('sorts[id]', 'desc');
-  url.searchParams.set('start_time', String(range.start_time));
-  url.searchParams.set('end_time', String(range.end_time));
-  url.searchParams.set('current_page', '1');
-  url.searchParams.set('page_size', '10');
-
-  const response = await authenticatedFetch(url);
-
-  return parseUpstreamResponse(
-    response,
-    'promotion-channel'
-  );
+  return fetchAllPages({
+    pathname:
+      '/api/ad/report/promotionchannelstat',
+    range,
+    extraParams: {},
+    name: 'promotion-channel',
+  });
 }
 
 async function getMemberLifecycle(range) {
-  const url = new URL(
-    `${API_BASE}/api/report/member-lifecycle`
-  );
-
-  url.searchParams.set('sorts[id]', 'desc');
-  url.searchParams.set('start_time', String(range.start_time));
-  url.searchParams.set('end_time', String(range.end_time));
-  url.searchParams.set('view', 'channel');
-  url.searchParams.set('actor_type', 'all');
-  url.searchParams.set('current_page', '1');
-  url.searchParams.set('page_size', '10');
-
-  const response = await authenticatedFetch(url);
-
-  return parseUpstreamResponse(
-    response,
-    'member-lifecycle'
-  );
+  return fetchAllPages({
+    pathname:
+      '/api/report/member-lifecycle',
+    range,
+    extraParams: {
+      view: 'channel',
+      actor_type: 'all',
+    },
+    name: 'member-lifecycle',
+  });
 }
 
 const server = http.createServer(async (req, res) => {
