@@ -1,74 +1,114 @@
 import http from 'node:http';
-import { URL } from 'node:url';
 
 const PORT = Number(process.env.PORT || 8080);
-const HOST = '0.0.0.0';
-
 const API_BASE = process.env.API_BASE || 'https://admin.y-f-r-h.com';
-const ORIGIN = process.env.ADMIN_ORIGIN || 'https://admin-inr911-htvlau.c-e-g-l.com';
-const SITE = process.env.X_SITE || 'inr911';
-const LANGUAGE = process.env.X_LANGUAGE || 'zh-CN';
+const ADMIN_ORIGIN = process.env.ADMIN_ORIGIN || 'https://admin-inr911-htvlau.c-e-g-l.com';
+const X_SITE = process.env.X_SITE || 'inr911';
+const X_LANGUAGE = process.env.X_LANGUAGE || 'zh-CN';
 const BEARER_TOKEN = process.env.BEARER_TOKEN || '';
 const API_KEY = process.env.API_KEY || '';
 
-function json(res, status, body) {
-  res.writeHead(status, {
+function sendJson(res, statusCode, data) {
+  res.writeHead(statusCode, {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
   });
-  res.end(JSON.stringify(body));
+  res.end(JSON.stringify(data));
 }
 
-function requireApiKey(req, res) {
-  if (!API_KEY) return true;
-  const key = req.headers['x-api-key'];
-  if (key !== API_KEY) {
-    json(res, 401, { ok: false, error: 'Unauthorized' });
-    return false;
+function getIndiaToday() {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date());
+
+  const map = Object.fromEntries(
+    parts
+      .filter((p) => p.type !== 'literal')
+      .map((p) => [p.type, p.value])
+  );
+
+  return `${map.year}-${map.month}-${map.day}`;
+}
+
+function isValidDateString(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value || '');
+}
+
+function getIndiaDateRange(dateStr) {
+  const targetDate = dateStr || getIndiaToday();
+
+  if (!isValidDateString(targetDate)) {
+    throw new Error('date 格式必須是 YYYY-MM-DD，例如 2026-09-21');
   }
-  return true;
-}
 
-function getAuthToken() {
-  if (!BEARER_TOKEN) {
-    throw new Error('Missing BEARER_TOKEN environment variable');
+  const start = new Date(`${targetDate}T00:00:00+05:30`);
+  const end = new Date(`${targetDate}T23:59:59+05:30`);
+
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+    throw new Error('無效日期');
   }
-  return BEARER_TOKEN.startsWith('Bearer ')
-    ? BEARER_TOKEN
-    : `Bearer ${BEARER_TOKEN}`;
-}
 
-function buildHeaders() {
   return {
-    accept: 'application/json, text/plain, */*',
-    'accept-language': 'zh-CN,zh;q=0.9',
-    authorization: getAuthToken(),
-    origin: ORIGIN,
-    referer: `${ORIGIN}/`,
-    'user-agent': 'Mozilla/5.0 (compatible; ZeaburReportBot/1.0)',
-    'x-language': LANGUAGE,
-    'x-site': SITE,
+    date: targetDate,
+    timezone: 'Asia/Kolkata',
+    start_local: `${targetDate} 00:00:00`,
+    end_local: `${targetDate} 23:59:59`,
+    start_time: Math.floor(start.getTime() / 1000),
+    end_time: Math.floor(end.getTime() / 1000),
   };
 }
 
-function copyQueryParams(inputUrl, targetUrl, allowed) {
-  for (const key of allowed) {
-    const value = inputUrl.searchParams.get(key);
-    if (value !== null && value !== '') {
-      targetUrl.searchParams.set(key, value);
+function getRequestedRange(url) {
+  const manualStart = url.searchParams.get('start_time');
+  const manualEnd = url.searchParams.get('end_time');
+
+  if (manualStart || manualEnd) {
+    if (!manualStart || !manualEnd) {
+      throw new Error('如果要手動指定 timestamp，start_time 與 end_time 必須一起提供');
     }
+
+    const start = Number(manualStart);
+    const end = Number(manualEnd);
+
+    if (!Number.isFinite(start) || !Number.isFinite(end)) {
+      throw new Error('start_time / end_time 必須是 Unix timestamp');
+    }
+
+    return {
+      date: null,
+      timezone: 'manual',
+      start_local: null,
+      end_local: null,
+      start_time: Math.floor(start),
+      end_time: Math.floor(end),
+    };
   }
+
+  const date = url.searchParams.get('date');
+  return getIndiaDateRange(date);
 }
 
-function applyDefaults(targetUrl, defaults) {
-  for (const [key, value] of Object.entries(defaults)) {
-    if (!targetUrl.searchParams.has(key) && value !== undefined && value !== null) {
-      targetUrl.searchParams.set(key, String(value));
-    }
+function buildHeaders() {
+  if (!BEARER_TOKEN) {
+    throw new Error('Zeabur 環境變數尚未設定 BEARER_TOKEN');
   }
+
+  return {
+    accept: 'application/json, text/plain, */*',
+    'accept-language': 'zh-CN,zh;q=0.9',
+    authorization: `Bearer ${BEARER_TOKEN}`,
+    origin: ADMIN_ORIGIN,
+    referer: `${ADMIN_ORIGIN}/`,
+    'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+    'x-language': X_LANGUAGE,
+    'x-site': X_SITE,
+  };
 }
 
-async function fetchJson(url) {
+async function requestJson(url) {
   const response = await fetch(url, {
     method: 'GET',
     headers: buildHeaders(),
@@ -77,151 +117,139 @@ async function fetchJson(url) {
 
   const text = await response.text();
   let data;
+
   try {
-    data = text ? JSON.parse(text) : null;
+    data = JSON.parse(text);
   } catch {
     data = { raw: text };
   }
 
   if (!response.ok) {
-    const err = new Error(`Upstream API ${response.status}`);
-    err.status = response.status;
-    err.data = data;
-    throw err;
+    const error = new Error(`上游 API 回傳 ${response.status}`);
+    error.status = response.status;
+    error.upstream = data;
+    throw error;
   }
 
   return data;
 }
 
-function requireTimeRange(inputUrl, res) {
-  const startTime = inputUrl.searchParams.get('start_time');
-  const endTime = inputUrl.searchParams.get('end_time');
-
-  if (!startTime || !endTime) {
-    json(res, 400, {
-      ok: false,
-      error: 'start_time and end_time are required',
-      example: '/all?start_time=1789929000&end_time=1790015399',
-    });
-    return false;
-  }
-  return true;
-}
-
-async function getPromotionChannel(inputUrl) {
-  const target = new URL('/api/ad/report/promotionchannelstat', API_BASE);
-
-  copyQueryParams(inputUrl, target, [
-    'start_time',
-    'end_time',
-    'current_page',
-    'page_size',
-  ]);
-
-  applyDefaults(target, {
+async function getPromotionChannel(range) {
+  const qs = new URLSearchParams({
     'sorts[id]': 'desc',
-    current_page: 1,
-    page_size: 1000,
+    start_time: String(range.start_time),
+    end_time: String(range.end_time),
+    current_page: '1',
+    page_size: '10',
   });
 
-  return {
-    name: 'promotion_channel_stat',
-    source: target.toString(),
-    data: await fetchJson(target),
-  };
+  const url = `${API_BASE}/api/ad/report/promotionchannelstat?${qs}`;
+  return requestJson(url);
 }
 
-async function getMemberLifecycle(inputUrl) {
-  // 你貼的第二段 curl 重複成 promotionchannelstat。
-  // 會員生命週期依你先前使用的後台路徑，使用 /api/report/member-lifecycle。
-  const target = new URL('/api/report/member-lifecycle', API_BASE);
-
-  copyQueryParams(inputUrl, target, [
-    'start_time',
-    'end_time',
-    'view',
-    'actor_type',
-    'current_page',
-    'page_size',
-  ]);
-
-  applyDefaults(target, {
+async function getMemberLifecycle(range) {
+  const qs = new URLSearchParams({
     'sorts[id]': 'desc',
+    start_time: String(range.start_time),
+    end_time: String(range.end_time),
     view: 'channel',
     actor_type: 'all',
-    current_page: 1,
-    page_size: 1000,
+    current_page: '1',
+    page_size: '10',
   });
 
-  return {
-    name: 'member_lifecycle',
-    source: target.toString(),
-    data: await fetchJson(target),
-  };
+  const url = `${API_BASE}/api/report/member-lifecycle?${qs}`;
+  return requestJson(url);
+}
+
+function checkApiKey(req) {
+  if (!API_KEY) return true;
+  return req.headers['x-api-key'] === API_KEY;
 }
 
 const server = http.createServer(async (req, res) => {
   try {
-    if (!requireApiKey(req, res)) return;
-
-    const inputUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
     if (req.method !== 'GET') {
-      return json(res, 405, { ok: false, error: 'Method not allowed' });
+      return sendJson(res, 405, {
+        ok: false,
+        error: 'Method Not Allowed',
+      });
     }
 
-    if (inputUrl.pathname === '/' || inputUrl.pathname === '/health') {
-      return json(res, 200, {
+    if (url.pathname === '/health') {
+      return sendJson(res, 200, {
         ok: true,
         service: 'zeabur-report-api',
+        timezone: 'Asia/Kolkata',
+        india_today: getIndiaToday(),
         endpoints: [
-          '/promotion-channel?start_time=...&end_time=...',
-          '/member-lifecycle?start_time=...&end_time=...',
-          '/all?start_time=...&end_time=...',
+          '/promotion-channel',
+          '/member-lifecycle',
+          '/all',
+          '/all?date=2026-09-20',
         ],
       });
     }
 
-    if (!requireTimeRange(inputUrl, res)) return;
-
-    if (inputUrl.pathname === '/promotion-channel') {
-      const result = await getPromotionChannel(inputUrl);
-      return json(res, 200, { ok: true, ...result });
-    }
-
-    if (inputUrl.pathname === '/member-lifecycle') {
-      const result = await getMemberLifecycle(inputUrl);
-      return json(res, 200, { ok: true, ...result });
-    }
-
-    if (inputUrl.pathname === '/all') {
-      const [promotion, lifecycle] = await Promise.all([
-        getPromotionChannel(inputUrl),
-        getMemberLifecycle(inputUrl),
-      ]);
-
-      return json(res, 200, {
-        ok: true,
-        query: {
-          start_time: inputUrl.searchParams.get('start_time'),
-          end_time: inputUrl.searchParams.get('end_time'),
-        },
-        promotion_channel: promotion.data,
-        member_lifecycle: lifecycle.data,
+    if (!checkApiKey(req)) {
+      return sendJson(res, 401, {
+        ok: false,
+        error: 'Invalid API key',
       });
     }
 
-    return json(res, 404, { ok: false, error: 'Not found' });
+    if (!['/promotion-channel', '/member-lifecycle', '/all'].includes(url.pathname)) {
+      return sendJson(res, 404, {
+        ok: false,
+        error: 'Not Found',
+      });
+    }
+
+    const range = getRequestedRange(url);
+
+    if (url.pathname === '/promotion-channel') {
+      const data = await getPromotionChannel(range);
+      return sendJson(res, 200, {
+        ok: true,
+        range,
+        promotion_channel: data,
+      });
+    }
+
+    if (url.pathname === '/member-lifecycle') {
+      const data = await getMemberLifecycle(range);
+      return sendJson(res, 200, {
+        ok: true,
+        range,
+        member_lifecycle: data,
+      });
+    }
+
+    const [promotionChannel, memberLifecycle] = await Promise.all([
+      getPromotionChannel(range),
+      getMemberLifecycle(range),
+    ]);
+
+    return sendJson(res, 200, {
+      ok: true,
+      range,
+      promotion_channel: promotionChannel,
+      member_lifecycle: memberLifecycle,
+    });
   } catch (error) {
     console.error(error);
-    return json(res, error.status || 500, {
+
+    return sendJson(res, error.status || 500, {
       ok: false,
-      error: error.message || 'Internal server error',
-      upstream: error.data || undefined,
+      error: error.message || 'Internal Server Error',
+      upstream: error.upstream || undefined,
     });
   }
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`zeabur-report-api listening on http://${HOST}:${PORT}`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`zeabur-report-api listening on http://0.0.0.0:${PORT}`);
+  console.log(`India today: ${getIndiaToday()}`);
 });
